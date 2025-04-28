@@ -1,0 +1,19 @@
+# Environment and keys
+.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# Logs
+*.log
+logs/
+
+# IDE files
+.idea/
+.vscode/
