@@ -46,7 +46,7 @@ TECHNICAL_WEIGHT = 0.6
 SIGNAL_THRESHOLD = 0.7  # Minimum score to generate a signal
 
 # System Parameters
-SCAN_INTERVAL = 120  # Scan interval in seconds (10 mins)
+SCAN_INTERVAL = 1800  # Scan interval in seconds (30 mins)
 MARKET_HOURS = {
     'open': '09:30',
     'close': '16:00',

@@ -1,5 +1,6 @@
 import logging
 import numpy as np
+from datetime import datetime
 
 from config.config import SENTIMENT_KEYWORDS
 from analysis.sentiment.news_fetcher import NewsFetcher
@@ -7,20 +8,14 @@ from analysis.sentiment.news_fetcher import NewsFetcher
 logger = logging.getLogger(__name__)
 
 class FinBERTAnalyzer:
-    """Sentiment analysis using FinBERT model (simplified for development)"""
+    """Simplified sentiment analysis without PyTorch dependency"""
     
-    def __init__(self, model_name="ProsusAI/finbert", max_length=512):
-        logger.info(f"Initializing FinBERT analyzer (simplified version)")
-        self.max_length = max_length
+    def __init__(self, model_name=None, max_length=None):
+        logger.info("Initializing simplified sentiment analyzer")
         self.news_fetcher = NewsFetcher()
-        # For the free tier development, we're using a simplified version
-        # without loading the actual FinBERT model to avoid dependencies
-        self.model = None
-        self.tokenizer = None
     
-    def _analyze_text_with_finbert(self, text):
-        """Analyze text using simplified sentiment analysis"""
-        # This is a simplistic approach for development
+    def _analyze_text(self, text):
+        """Simple keyword-based sentiment analysis"""
         positive_words = ["bullish", "up", "rise", "growth", "profit", "positive", "beat", "exceed", 
                          "strong", "surge", "gain", "opportunity", "optimistic", "momentum"]
         negative_words = ["bearish", "down", "fall", "decline", "loss", "negative", "miss", "below", 
@@ -51,7 +46,7 @@ class FinBERTAnalyzer:
             "raw_scores": {
                 "positive": pos_count / (total or 1),
                 "negative": neg_count / (total or 1),
-                "neutral": 1 - ((pos_count + neg_count) / (total or 1) if total else 0)
+                "neutral": 1 - (pos_count + neg_count) / (total or 1) if total else 1
             }
         }
     
@@ -67,7 +62,7 @@ class FinBERTAnalyzer:
                 "overall_score": 0,
                 "sentiment_label": "neutral",
                 "article_count": 0,
-                "keyword_matches": {}
+                "keyword_matches": {keyword: 0 for keyword in SENTIMENT_KEYWORDS}
             }
         
         # Analyze each article
@@ -82,7 +77,7 @@ class FinBERTAnalyzer:
                     keyword_matches[keyword] += 1
             
             # Get sentiment score
-            sentiment = self._analyze_text_with_finbert(article_text)
+            sentiment = self._analyze_text(article_text)
             sentiment_scores.append(sentiment["score"])
         
         # Aggregate sentiment scores
@@ -122,7 +117,7 @@ class FinBERTAnalyzer:
                 "overall_score": 0,
                 "sentiment_label": "neutral",
                 "article_count": 0,
-                "keyword_matches": {}
+                "keyword_matches": {keyword: 0 for keyword in SENTIMENT_KEYWORDS}
             }
         
         # Analyze each article
@@ -137,7 +132,7 @@ class FinBERTAnalyzer:
                     keyword_matches[keyword] += 1
             
             # Get sentiment score
-            sentiment = self._analyze_text_with_finbert(article_text)
+            sentiment = self._analyze_text(article_text)
             sentiment_scores.append(sentiment["score"])
         
         # Aggregate sentiment scores

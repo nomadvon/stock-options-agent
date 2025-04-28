@@ -55,6 +55,9 @@ class SignalEngine:
         combined_score = (sentiment_score * self.sentiment_weight + 
                          technical_score * self.technical_weight)
         
+        # Ensure score stays in valid range
+        combined_score = max(min(combined_score, 1.0), 0.0)
+        
         return {
             'combined': combined_score,
             'sentiment': sentiment_score,
