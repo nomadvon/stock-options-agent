@@ -1,6 +1,6 @@
 import logging
 from config.logging_config import setup_logging
-from data.polygon_connector import PolygonConnector
+from data.alpaca_connector import AlpacaConnector
 from analysis.sentiment.finbert_analyzer import FinBERTAnalyzer
 from analysis.technical.indicators import TechnicalAnalysis
 from engine.signal_engine import SignalEngine
@@ -16,7 +16,7 @@ def run_single_scan():
     
     try:
         # Initialize components
-        polygon = PolygonConnector()
+        alpaca = AlpacaConnector()
         sentiment_analyzer = FinBERTAnalyzer()
         technical_analyzer = TechnicalAnalysis()
         signal_engine = SignalEngine()

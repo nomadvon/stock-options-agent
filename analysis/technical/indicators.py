@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timedelta
 
 from config.config import TRADING_SYMBOLS, TECHNICAL_TIMEFRAMES
-from data.polygon_connector import PolygonConnector
+from data.alpaca_connector import AlpacaConnector
 
 logger = logging.getLogger(__name__)
 
@@ -13,49 +13,35 @@ class TechnicalAnalysis:
     """Technical analysis for stocks"""
     
     def __init__(self):
-        self.polygon = PolygonConnector()
+        self.alpaca = AlpacaConnector()
         
     def fetch_historical_data(self, symbol, timeframe='1d', days_back=30):
-        """Fetch historical price data for technical analysis from Polygon API"""
+        """Fetch historical price data for technical analysis from Alpaca API"""
         today = datetime.now()
         from_date = (today - timedelta(days=days_back)).strftime('%Y-%m-%d')
         to_date = today.strftime('%Y-%m-%d')
         
         try:
-            # Map timeframe to Polygon timespan
-            timespan_map = {'1h': 'hour', '4h': 'hour', '1d': 'day'}
-            timespan = timespan_map.get(timeframe, 'day')
-            
             # For 4h timeframe, we need to fetch hourly data and resample
             if timeframe == '4h':
-                df = self.polygon.get_option_historical(symbol, from_date, to_date, 'hour')
+                df = self.alpaca.get_historical_bars(symbol, '1h', from_date, to_date)
                 if not df.empty:
-                    df.set_index('timestamp', inplace=True)
+                    df.set_index('date', inplace=True)
                     df = df.resample('4H').agg({
-                        'o': 'first',
-                        'h': 'max',
-                        'l': 'min',
-                        'c': 'last',
-                        'v': 'sum'
+                        'open': 'first',
+                        'high': 'max',
+                        'low': 'min',
+                        'close': 'last',
+                        'volume': 'sum'
                     }).dropna()
                     df.reset_index(inplace=True)
             else:
-                df = self.polygon.get_option_historical(symbol, from_date, to_date, timespan)
+                df = self.alpaca.get_historical_bars(symbol, timeframe, from_date, to_date)
             
             # If API call failed or returned empty data, use fallback method
             if df is None or df.empty:
                 logger.warning(f"No data from API for {symbol} with {timeframe} timeframe. Using fallback data.")
                 return self._create_fallback_data(symbol, days_back)
-            
-            # Rename columns to standard OHLCV format
-            df = df.rename(columns={
-                'o': 'open',
-                'h': 'high',
-                'l': 'low',
-                'c': 'close',
-                'v': 'volume',
-                'timestamp': 'date'
-            })
             
             return df
         
@@ -71,9 +57,9 @@ class TechnicalAnalysis:
         
         # Get base price from recent quote if possible
         try:
-            recent_quote = self.polygon.get_real_time_data([symbol])
-            if symbol in recent_quote and 'p' in recent_quote[symbol]:
-                base_price = recent_quote[symbol]['p']
+            recent_quote = self.alpaca.get_latest_quote(symbol)
+            if recent_quote and 'bid_price' in recent_quote:
+                base_price = recent_quote['bid_price']
             else:
                 base_price = self._get_default_price(symbol)
         except:
