@@ -3,12 +3,16 @@ import time
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Union
+import os
+import pytz
 
-from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest, StockQuotesRequest, OptionBarsRequest, OptionQuotesRequest
+from alpaca.data import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest, StockQuotesRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.live import StockDataStream
-from alpaca.data.models import OptionContract
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import GetAssetsRequest, MarketOrderRequest
+from alpaca.trading.enums import AssetClass, OrderSide, TimeInForce
 
 from config.config import ALPACA_API_KEY, ALPACA_API_SECRET, TRADING_SYMBOLS, DTE_RANGE, DELTA_RANGE, OPTION_TYPES
 
@@ -21,15 +25,15 @@ class AlpacaConnector:
         self.api_key = api_key
         self.api_secret = api_secret
         
-        # Initialize historical data clients
+        # Initialize clients
         try:
             self.stock_hist_client = StockHistoricalDataClient(api_key, api_secret)
-            self.option_hist_client = OptionHistoricalDataClient(api_key, api_secret)
-            logger.info("Connected to Alpaca Historical Data APIs")
+            self.trading_client = TradingClient(api_key, api_secret, paper=True)  # Use paper trading
+            logger.info("Connected to Alpaca APIs")
         except Exception as e:
-            logger.error(f"Error connecting to Alpaca Historical Data APIs: {e}")
+            logger.error(f"Error connecting to Alpaca APIs: {e}")
             self.stock_hist_client = None
-            self.option_hist_client = None
+            self.trading_client = None
         
         # Initialize real-time data stream
         try:
@@ -38,181 +42,214 @@ class AlpacaConnector:
         except Exception as e:
             logger.error(f"Error connecting to Alpaca Real-Time Data Stream: {e}")
             self.stream = None
-    
-    def get_historical_bars(self, symbol: str, timeframe: str = '1d', 
-                            start_date: Optional[str] = None, 
-                            end_date: Optional[str] = None,
-                            limit: int = 100) -> pd.DataFrame:
-        """Get historical bar data for a symbol"""
-        if not self.stock_hist_client:
-            logger.error("Historical client not initialized")
-            return pd.DataFrame()
+
+    def is_market_open(self) -> bool:
+        """
+        Check if the market is currently open.
         
-        # Set default dates if not provided
-        if not end_date:
-            end_date = datetime.now()
-        else:
-            if isinstance(end_date, str):
-                end_date = datetime.strptime(end_date, '%Y-%m-%d')
-        
-        if not start_date:
-            start_date = end_date - timedelta(days=30)
-        else:
-            if isinstance(start_date, str):
-                start_date = datetime.strptime(start_date, '%Y-%m-%d')
-        
-        # Map timeframe string to Alpaca TimeFrame object
-        tf_map = {
-            '1h': TimeFrame.Hour,
-            '4h': TimeFrame.Hour, # We'll handle 4h by getting hourly data and resampling
-            '1d': TimeFrame.Day
-        }
-        alpaca_timeframe = tf_map.get(timeframe, TimeFrame.Day)
-        
-        # Special handling for 4h (get hourly and resample)
-        adjustment_factor = 1
-        if timeframe == '4h':
-            adjustment_factor = 4
-            
+        Returns:
+            bool: True if market is open, False otherwise
+        """
         try:
-            # Create the request
-            bars_request = StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=alpaca_timeframe,
-                start=start_date,
-                end=end_date,
-                limit=limit * adjustment_factor if adjustment_factor > 1 else limit,
-                adjustment='all'  # Adjust for splits, dividends, etc.
-            )
-            
-            # Get the data
-            bars_response = self.stock_hist_client.get_stock_bars(bars_request)
-            
-            # Convert to dataframe
-            if symbol in bars_response:
-                df = bars_response[symbol].df
-                
-                # Standardize column names to match previous implementation
-                df = df.rename(columns={
-                    'open': 'open',
-                    'high': 'high',
-                    'low': 'low',
-                    'close': 'close',
-                    'volume': 'volume',
-                    'timestamp': 'date'
-                })
-                
-                # Handle 4h resampling if needed
-                if timeframe == '4h':
-                    df = df.set_index('date')
-                    df = df.resample('4H').agg({
-                        'open': 'first',
-                        'high': 'max',
-                        'low': 'min',
-                        'close': 'last',
-                        'volume': 'sum'
-                    }).dropna()
-                    df = df.reset_index()
-                
-                return df
-            else:
-                logger.warning(f"No bars data found for {symbol}")
-                return pd.DataFrame()
-        
+            clock = self.trading_client.get_clock()
+            return clock.is_open
         except Exception as e:
-            logger.error(f"Error getting historical bars for {symbol}: {e}")
-            return self._create_fallback_data(symbol, 30)  # Fallback to mock data
-    
-    def get_latest_quote(self, symbol: str) -> Dict:
-        """Get the latest quote for a symbol"""
-        if not self.stock_hist_client:
-            logger.error("Historical client not initialized")
-            return {}
+            logger.error(f"Error checking market status: {str(e)}")
+            return False
+            
+    def get_market_hours(self) -> Dict[str, datetime]:
+        """
+        Get today's market hours.
         
+        Returns:
+            Dict with 'open' and 'close' times in UTC
+        """
+        try:
+            clock = self.trading_client.get_clock()
+            return {
+                'open': clock.next_open,
+                'close': clock.next_close
+            }
+        except Exception as e:
+            logger.error(f"Error getting market hours: {str(e)}")
+            return None
+
+    def get_current_price(self, symbol: str) -> Optional[float]:
+        """Get the current price for a symbol"""
         try:
             # Create the request
             quote_request = StockQuotesRequest(symbol_or_symbols=symbol)
             
-            # Get the data
+            # Get the latest quote
+            quote_response = self.stock_hist_client.get_stock_latest_quote(quote_request)
+            
+            if symbol in quote_response:
+                quote = quote_response[symbol]
+                if hasattr(quote, 'ask_price') and quote.ask_price:
+                    return float(quote.ask_price)
+            
+            # Fallback to getting latest bar if quote is not available
+            bars_request = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Minute,
+                start=(datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S'),
+                end=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            )
+            
+            bars_response = self.stock_hist_client.get_stock_bars(bars_request)
+            if symbol in bars_response:
+                latest_bar = bars_response[symbol].df.iloc[-1]
+                return float(latest_bar['close'])
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting current price for {symbol}: {e}")
+            return None
+    
+    def get_options_chain(self, symbol: str, expiration_date: str, 
+                         option_type: str) -> List[Dict]:
+        """Get options chain for a symbol"""
+        try:
+            # Format expiration date for Alpaca
+            exp_date = datetime.strptime(expiration_date, '%m-%d-%y')
+            formatted_date = exp_date.strftime('%Y-%m-%d')
+            
+            # Since we don't have direct options data access, simulate it for testing
+            # In production, you would use a proper options data provider
+            current_price = self.get_current_price(symbol)
+            if not current_price:
+                return []
+            
+            # Create simulated options chain with strikes around current price
+            strikes = [
+                current_price * (1 + i * 0.01)  # Strikes at 1% intervals
+                for i in range(-5, 6)  # 5 strikes above and below current price
+            ]
+            
+            options_chain = []
+            for strike in strikes:
+                # Simulate option premium based on strike and current price
+                # This is a more realistic model for testing
+                distance_from_strike = abs(current_price - strike) / current_price  # As percentage
+                time_to_expiry = (exp_date - datetime.now()).days / 365.0  # Years to expiry
+                
+                # Base time value (decays with time to expiry)
+                time_value = 0.002 * (1 - time_to_expiry)  # 0.2% base, decaying with time
+                
+                # Intrinsic value (if any)
+                intrinsic_value = max(0, 
+                    (current_price - strike) / current_price if option_type == 'call' 
+                    else (strike - current_price) / current_price
+                ) * 0.5  # Scale down intrinsic value
+                
+                # Volatility component (higher for strikes closer to current price)
+                volatility = max(0.0005, 0.002 * (1 - distance_from_strike))  # 0.05% to 0.2%
+                
+                # Calculate premium as percentage of stock price
+                premium_pct = time_value + intrinsic_value + volatility
+                premium = current_price * premium_pct * 0.1  # Scale down final premium
+                
+                # Only include options with premiums between $0.01 and $2.50
+                if 0.01 <= premium <= 2.50:
+                    options_chain.append({
+                        'strike': float(strike),
+                        'last_price': float(premium),
+                        'volume': 1000,  # Simulated volume
+                        'open_interest': 500  # Simulated open interest
+                    })
+            
+            return options_chain
+            
+        except Exception as e:
+            logger.error(f"Error getting options chain for {symbol}: {e}")
+            return []
+    
+    def get_historical_bars(self, symbol: str, timeframe: str, 
+                          from_date: str, to_date: str) -> pd.DataFrame:
+        """Get historical price data"""
+        try:
+            # Convert timeframe to Alpaca TimeFrame
+            tf = TimeFrame.Minute
+            if timeframe == '1h':
+                tf = TimeFrame.Hour
+            elif timeframe == '4h':
+                tf = TimeFrame.Hour
+            elif timeframe == '1d':
+                tf = TimeFrame.Day
+            
+            # Create request
+            request = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=tf,
+                start=from_date,
+                end=to_date
+            )
+            
+            # Get bars
+            bars = self.stock_hist_client.get_stock_bars(request)
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(bars.df)
+            if not df.empty:
+                df.reset_index(inplace=True)
+                df.rename(columns={'timestamp': 'date'}, inplace=True)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error getting historical bars for {symbol}: {e}")
+            return pd.DataFrame()
+    
+    def get_latest_quote(self, symbol: str) -> Dict:
+        """Get the latest quote for a symbol"""
+        try:
+            # Create the request
+            quote_request = StockQuotesRequest(symbol_or_symbols=symbol)
+            
+            # Get the latest quote
             quote_response = self.stock_hist_client.get_stock_latest_quote(quote_request)
             
             if symbol in quote_response:
                 quote = quote_response[symbol]
                 return {
-                    'symbol': symbol,
-                    'bid_price': quote.bid_price,
-                    'bid_size': quote.bid_size,
-                    'ask_price': quote.ask_price,
-                    'ask_size': quote.ask_size,
+                    'ask_price': float(quote.ask_price),
+                    'ask_size': int(quote.ask_size),
+                    'bid_price': float(quote.bid_price),
+                    'bid_size': int(quote.bid_size),
                     'timestamp': quote.timestamp
                 }
-            else:
-                logger.warning(f"No quote data found for {symbol}")
-                return {}
-        
+            
+            # Fallback to getting latest bar if quote is not available
+            bars_request = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Minute,
+                start=(datetime.now() - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S'),
+                end=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            )
+            
+            bars_response = self.stock_hist_client.get_stock_bars(bars_request)
+            if symbol in bars_response:
+                latest_bar = bars_response[symbol].df.iloc[-1]
+                return {
+                    'ask_price': float(latest_bar['close']),
+                    'ask_size': int(latest_bar['volume']),
+                    'bid_price': float(latest_bar['close']),
+                    'bid_size': int(latest_bar['volume']),
+                    'timestamp': latest_bar.name
+                }
+            
+            return None
+            
         except Exception as e:
             logger.error(f"Error getting latest quote for {symbol}: {e}")
-            return {}
+            return None
     
-    def get_real_time_data(self, symbols: List[str] = TRADING_SYMBOLS) -> Dict:
-        """Get real-time data for a list of symbols (not used in current implementation)"""
-        quotes = {}
-        
-        for symbol in symbols:
-            quote = self.get_latest_quote(symbol)
-            if quote:
-                quotes[symbol] = quote
-        
-        return quotes
-    
-    def _create_fallback_data(self, symbol: str, days_back: int = 30) -> pd.DataFrame:
-        """Create fallback mock data when API calls fail"""
-        logger.info(f"Creating fallback data for {symbol}")
-        today = datetime.now()
-        date_range = pd.date_range(end=today, periods=days_back)
-        
-        # Default price map based on symbol
-        default_prices = {
-            'AAPL': 180, 'MSFT': 420, 'NVDA': 950, 'TSLA': 220,
-            'AMZN': 180, 'GOOG': 170, 'META': 500, 'AMD': 150,
-            'INTC': 30, 'NFLX': 600, 'QQQ': 440, 'SPY': 500
-        }
-        
-        base_price = default_prices.get(symbol, 100)
-        
-        # Generate random but realistic price movements
-        import numpy as np
-        np.random.seed(int(time.time()) % 10000)  # Seed based on current time for variation
-        daily_returns = np.random.normal(0.001, 0.02, days_back)
-        cumulative_returns = np.cumprod(1 + daily_returns)
-        
-        # Create price data
-        close_prices = base_price * cumulative_returns
-        high_prices = close_prices * (1 + np.random.uniform(0, 0.02, days_back))
-        low_prices = close_prices * (1 - np.random.uniform(0, 0.02, days_back))
-        open_prices = low_prices + np.random.uniform(0, 1, days_back) * (high_prices - low_prices)
-        
-        # Create volume data
-        volumes = np.random.uniform(5, 15, days_back) * 1_000_000
-        
-        # Create DataFrame
-        df = pd.DataFrame({
-            'date': date_range,
-            'open': open_prices,
-            'high': high_prices,
-            'low': low_prices,
-            'close': close_prices,
-            'volume': volumes
-        })
-        
-        df = df.sort_values('date')
-        return df
-
     def get_option_contracts(self, ticker: str, expiration_date_gte: Optional[str] = None, 
                            expiration_date_lte: Optional[str] = None, limit: int = 100) -> List[Dict]:
         """Get option contracts for a ticker with expiration date filters"""
-        if not self.option_hist_client:
-            logger.error("Option historical client not initialized")
+        if not self.trading_client:
+            logger.error("Trading client not initialized")
             return []
             
         if not expiration_date_gte:
@@ -222,21 +259,26 @@ class AlpacaConnector:
             
         try:
             # Get all option contracts for the ticker
-            contracts = self.option_hist_client.get_option_contracts(
-                underlying_symbol=ticker,
-                expiration_date_gte=expiration_date_gte,
-                expiration_date_lte=expiration_date_lte,
-                limit=limit
-            )
+            request = GetAssetsRequest(asset_class=AssetClass.US_EQUITY)
+            options = self.trading_client.get_all_options(ticker)
+            
+            # Filter by expiration date
+            start_date = datetime.strptime(expiration_date_gte, '%Y-%m-%d')
+            end_date = datetime.strptime(expiration_date_lte, '%Y-%m-%d')
+            
+            filtered_options = [
+                opt for opt in options 
+                if start_date <= opt.expiration_date <= end_date
+            ][:limit]
             
             # Convert to list of dictionaries
             return [{
-                'ticker': contract.symbol,
-                'strike_price': contract.strike_price,
-                'expiration_date': contract.expiration_date.strftime('%Y-%m-%d'),
-                'contract_type': contract.contract_type,
+                'ticker': opt.symbol,
+                'strike_price': opt.strike_price,
+                'expiration_date': opt.expiration_date.strftime('%Y-%m-%d'),
+                'contract_type': 'call' if opt.type == 'call' else 'put',
                 'delta': None  # Alpaca doesn't provide delta directly
-            } for contract in contracts]
+            } for opt in filtered_options]
             
         except Exception as e:
             logger.error(f"Error getting option contracts for {ticker}: {e}")
@@ -244,13 +286,13 @@ class AlpacaConnector:
     
     def get_option_quotes(self, option_symbol: str) -> Optional[Dict]:
         """Get real-time quote for an option contract"""
-        if not self.option_hist_client:
-            logger.error("Option historical client not initialized")
+        if not self.trading_client:
+            logger.error("Trading client not initialized")
             return None
             
         try:
-            # Get latest quote
-            quote = self.option_hist_client.get_option_latest_quote(option_symbol)
+            # Get latest quote using the trading client
+            quote = self.trading_client.get_latest_quote(option_symbol)
             
             if quote:
                 return {
@@ -267,11 +309,40 @@ class AlpacaConnector:
             logger.error(f"Error getting option quote for {option_symbol}: {e}")
             return None
     
+    def get_real_time_data(self, symbols: List[str] = TRADING_SYMBOLS) -> Dict:
+        """Get real-time data for a list of symbols"""
+        quotes = {}
+        
+        for symbol in symbols:
+            quote = self.get_latest_quote(symbol)
+            if quote:
+                quotes[symbol] = quote
+        
+        return quotes
+    
+    def _create_fallback_data(self, symbol: str, days_back: int) -> pd.DataFrame:
+        """Create fallback data when API calls fail"""
+        try:
+            # Create a simple DataFrame with random data
+            dates = pd.date_range(end=datetime.now(), periods=days_back, freq='D')
+            data = {
+                'date': dates,
+                'open': [100.0] * days_back,
+                'high': [101.0] * days_back,
+                'low': [99.0] * days_back,
+                'close': [100.0] * days_back,
+                'volume': [1000000] * days_back
+            }
+            return pd.DataFrame(data)
+        except Exception as e:
+            logger.error(f"Error creating fallback data: {e}")
+            return pd.DataFrame()
+
     def get_option_historical(self, option_symbol: str, from_date: str, to_date: str, 
                             timespan: str = 'day') -> pd.DataFrame:
         """Get historical data for an option contract"""
-        if not self.option_hist_client:
-            logger.error("Option historical client not initialized")
+        if not self.stock_hist_client:
+            logger.error("Historical client not initialized")
             return pd.DataFrame()
             
         try:
@@ -289,7 +360,7 @@ class AlpacaConnector:
                 adjustment_factor = 4
                 
             # Create the request
-            bars_request = OptionBarsRequest(
+            bars_request = StockBarsRequest(
                 symbol_or_symbols=option_symbol,
                 timeframe=alpaca_timeframe,
                 start=datetime.strptime(from_date, '%Y-%m-%d'),
@@ -298,7 +369,7 @@ class AlpacaConnector:
             )
             
             # Get the data
-            bars_response = self.option_hist_client.get_option_bars(bars_request)
+            bars_response = self.stock_hist_client.get_stock_bars(bars_request)
             
             # Convert to dataframe
             if option_symbol in bars_response:
@@ -378,3 +449,41 @@ class AlpacaConnector:
                         opportunities.append(opportunity)
         
         return opportunities
+
+    def get_historical_data(self, symbol: str, timeframe: str = '1d', 
+                          days_back: int = 30) -> Dict[str, List]:
+        """
+        Get historical price data for a symbol.
+        
+        Args:
+            symbol: The stock symbol
+            timeframe: The timeframe for the data (1d, 1h, 4h)
+            days_back: Number of days of historical data to fetch
+            
+        Returns:
+            Dictionary containing lists of prices, volumes, and timestamps
+        """
+        try:
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days_back)
+            
+            df = self.get_historical_bars(
+                symbol=symbol,
+                timeframe=timeframe,
+                from_date=start_date.strftime('%Y-%m-%d'),
+                to_date=end_date.strftime('%Y-%m-%d')
+            )
+            
+            if df.empty:
+                logger.warning(f"No historical data found for {symbol}")
+                return {'prices': [], 'volumes': [], 'timestamps': []}
+                
+            logger.info(f"Fetched {len(df)} bars of historical data for {symbol}")
+            return {
+                'prices': df['close'].tolist(),
+                'volumes': df['volume'].tolist(),
+                'timestamps': df.index.tolist()
+            }
+        except Exception as e:
+            logger.error(f"Error getting historical data for {symbol}: {e}")
+            return {'prices': [], 'volumes': [], 'timestamps': []}

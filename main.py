@@ -1,122 +1,79 @@
+import asyncio
 import logging
-import time
-import schedule
-from datetime import datetime
-import pytz
+import os
+from typing import List
+from dotenv import load_dotenv
 
-from config.config import TRADING_SYMBOLS, SCAN_INTERVAL, MARKET_HOURS
-from config.logging_config import setup_logging
-from data.alpaca_connector import AlpacaConnector
-from analysis.sentiment.finbert_analyzer import FinBERTAnalyzer
-from analysis.technical.indicators import TechnicalAnalysis
-from engine.signal_engine import SignalEngine
-from alerts.discord_webhook import DiscordAlert
-from utils.helpers import is_market_open
-from utils.aws_utils import AWSIntegration  # New import for AWS integration
+from events.event_queue import EventQueue
+from monitors.price_monitor import PriceMonitor
+from monitors.news_monitor import NewsMonitor
+from processors.event_processor import EventProcessor
+from generators.signal_generator import SignalGenerator
 
-# Setup logging
-logger = setup_logging()
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-def scan_for_opportunities():
-    """Main function to scan for trading opportunities"""
-    logger.info("Starting scan for trading opportunities...")
-    
+# Load environment variables
+load_dotenv()  # Load environment variables from .env file
+
+# Debug log environment variables (masking sensitive values)
+logger.info("Environment variables loaded:")
+logger.info(f"ALPACA_API_KEY: {'*' * len(os.getenv('ALPACA_API_KEY', ''))}")
+logger.info(f"ALPACA_API_SECRET: {'*' * len(os.getenv('ALPACA_API_SECRET', ''))}")
+logger.info(f"OPENAI_API_KEY: {'*' * len(os.getenv('OPENAI_API_KEY', ''))}")
+logger.info(f"DISCORD_WEBHOOK_URL: {'*' * len(os.getenv('DISCORD_WEBHOOK_URL', ''))}")
+logger.info(f"NEWS_API_KEY: {'*' * len(os.getenv('NEWS_API_KEY', ''))}")
+logger.info(f"AWS_ACCESS_KEY_ID: {'*' * len(os.getenv('AWS_ACCESS_KEY_ID', ''))}")
+logger.info(f"AWS_SECRET_ACCESS_KEY: {'*' * len(os.getenv('AWS_SECRET_ACCESS_KEY', ''))}")
+logger.info(f"AWS_REGION: {os.getenv('AWS_REGION', 'not set')}")
+
+# Configuration
+TRADING_SYMBOLS = ['AAPL', 'MSFT', 'GOOGL']
+
+async def main():
+    """Initialize and run the trading system"""
     try:
         # Initialize components
-        alpaca = AlpacaConnector()
-        sentiment_analyzer = FinBERTAnalyzer()
-        technical_analyzer = TechnicalAnalysis()
-        signal_engine = SignalEngine()
-        discord_alert = DiscordAlert()
-        aws = AWSIntegration()  # Initialize AWS integration
-        
-        # Track signals for metrics
-        signal_count = 0
-        
-        # Process each symbol
-        for symbol in TRADING_SYMBOLS:
-            logger.info(f"Processing {symbol}...")
-            
-            # Get sentiment data
-            sentiment_data = sentiment_analyzer.get_ticker_sentiment(symbol)
-            
-            # Record sentiment as CloudWatch metric
-            if sentiment_data and 'overall_score' in sentiment_data:
-                aws.put_metric("SentimentScore", sentiment_data['overall_score'], symbol, "None")
-            
-            # Get technical signals
-            technical_data = technical_analyzer.get_technical_signals(symbol)
-            
-            # Generate trade signals
-            signals = signal_engine.generate_signals(symbol, sentiment_data, technical_data)
-            signal_count += len(signals)
-            
-            # Send alerts for valid signals
-            for signal in signals:
-                if signal['confidence'] >= signal_engine.signal_threshold:
-                    discord_alert.send_trade_alert(signal)
-                    
-                    # Record signal details in CloudWatch
-                    aws.put_metric("SignalConfidence", signal['confidence'], symbol, "None")
-                    aws.put_metric("SignalGenerated", 1, symbol, "Count")
-        
-        # Record scan metrics
-        aws.put_metric("TotalSignals", signal_count, "ALL", "Count")
-        aws.put_metric("ScanCompleted", 1, "ALL", "Count")
-        
-        logger.info("Scan completed successfully")
-        
-    except Exception as e:
-        logger.error(f"Error during scan: {e}", exc_info=True)
-        
-        # Record error in CloudWatch
-        try:
-            aws = AWSIntegration()
-            aws.put_metric("ScanError", 1, "ALL", "Count")
-        except:
-            pass  # Avoid errors in error handling
-
-def main():
-    """Main entry point"""
-    logger.info("Starting Real-Time Stock Options Swing Trade Agent")
-    
-    # Initialize AWS integration
-    aws = AWSIntegration()
-    
-    # Send startup notification
-    discord_alert = DiscordAlert()
-    discord_alert.send_system_notification(
-        "Swing Trade Agent Started",
-        f"The Options Swing Trade Agent has started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.\n"
-        f"Monitoring: {', '.join(TRADING_SYMBOLS)}\n"
-        f"Scan interval: {SCAN_INTERVAL} seconds"
-    )
-    
-    # Record startup in CloudWatch
-    aws.put_metric("AgentStartup", 1, "ALL", "Count")
-    
-    # Run initial scan
-    scan_for_opportunities()
-    
-    # Schedule regular scans
-    schedule.every(SCAN_INTERVAL).seconds.do(scan_for_opportunities)
-    
-    # Keep the script running
-    try:
-        while True:
-            schedule.run_pending()
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Shutting down gracefully...")
-        
-        # Send shutdown notification
-        discord_alert.send_system_notification(
-            "Agent Stopped",
-            f"The Options Swing Trade Agent has been stopped at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}."
+        event_queue = EventQueue()
+        price_monitor = PriceMonitor(
+            api_key=os.getenv('ALPACA_API_KEY'),
+            api_secret=os.getenv('ALPACA_API_SECRET'),
+            event_queue=event_queue
+        )
+        news_monitor = NewsMonitor(event_queue)
+        event_processor = EventProcessor(event_queue)
+        signal_generator = SignalGenerator(
+            event_queue=event_queue,
+            openai_api_key=os.getenv('OPENAI_API_KEY')
         )
         
-        # Record shutdown in CloudWatch
-        aws.put_metric("AgentShutdown", 1, "ALL", "Count")
+        # Start components in order
+        await event_queue.start()
+        await price_monitor.start(TRADING_SYMBOLS)
+        await news_monitor.start(TRADING_SYMBOLS)  # Pass symbols to news monitor
+        await event_processor.start()
+        await signal_generator.start()
+        
+        # Keep the main loop running
+        while True:
+            await asyncio.sleep(1)
+            
+    except Exception as e:
+        logger.error(f"Error in main loop: {e}")
+    finally:
+        # Cleanup
+        await event_queue.stop()
+        await price_monitor.stop()
+        await news_monitor.stop()
+        await event_processor.stop()
+        await signal_generator.stop()
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
